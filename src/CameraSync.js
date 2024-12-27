@@ -1,42 +1,49 @@
 import React, { useState, useRef, useEffect } from 'react';
-import { io } from 'socket.io-client';
+import io from 'socket.io-client';
 
-const VideoShare = () => {
+const CameraSync = () => {
   const [roomId, setRoomId] = useState('');
   const [deviceType, setDeviceType] = useState('laptop');
+  const [connected, setConnected] = useState(false);
   const [status, setStatus] = useState('');
-  const [isConnected, setIsConnected] = useState(false);
 
-  const localVideoRef = useRef();
-  const remoteVideoRef = useRef();
-  const socketRef = useRef();
-  const peerRef = useRef();
-  const streamRef = useRef();
+  const localVideoRef = useRef(null);
+  const remoteVideoRef = useRef(null);
+  const socketRef = useRef(null);
+  const peerConnectionRef = useRef(null);
+  const localStreamRef = useRef(null);
 
-  const initializePeerConnection = () => {
-    const peer = new RTCPeerConnection({
-      iceServers: [{ urls: 'stun:stun.l.google.com:19302' }]
+  const createPeerConnection = () => {
+    const pc = new RTCPeerConnection({
+      iceServers: [
+        { urls: 'stun:stun.l.google.com:19302' },
+        { urls: 'stun:stun1.l.google.com:19302' }
+      ]
     });
 
-    peer.onicecandidate = (event) => {
+    pc.onicecandidate = (event) => {
       if (event.candidate) {
-        socketRef.current.emit('ice-candidate', {
+        socketRef.current.emit('iceCandidate', {
           roomId,
           candidate: event.candidate
         });
       }
     };
 
-    peer.ontrack = (event) => {
+    pc.ontrack = (event) => {
       if (remoteVideoRef.current) {
         remoteVideoRef.current.srcObject = event.streams[0];
       }
     };
 
-    return peer;
+    pc.onconnectionstatechange = (event) => {
+      console.log('Connection state:', pc.connectionState);
+    };
+
+    return pc;
   };
 
-  const startStream = async () => {
+  const startLocalStream = async () => {
     try {
       const constraints = {
         video: {
@@ -46,78 +53,94 @@ const VideoShare = () => {
       };
 
       const stream = await navigator.mediaDevices.getUserMedia(constraints);
-      streamRef.current = stream;
-      localVideoRef.current.srcObject = stream;
+      localStreamRef.current = stream;
+      if (localVideoRef.current) {
+        localVideoRef.current.srcObject = stream;
+      }
       return stream;
     } catch (error) {
-      setStatus(`Camera error: ${error.message}`);
+      setStatus('Camera access denied');
       throw error;
     }
   };
 
   const handleConnect = async () => {
     if (!roomId) {
-      setStatus('Enter room ID');
+      setStatus('Please enter a room ID');
       return;
     }
 
     try {
-      const stream = await startStream();
-      socketRef.current = io('https://exam-temp-backend.onrender.com');
-      peerRef.current = initializePeerConnection();
-
-      stream.getTracks().forEach(track => {
-        peerRef.current.addTrack(track, stream);
+      socketRef.current = io('http://localhost:8888/', {
+        transports: ['websocket'],
+        reconnection: true,
+        reconnectionAttempts: 5,
+        reconnectionDelay: 1000
       });
 
-      socketRef.current.emit('join', { roomId, deviceType });
+      const stream = await startLocalStream();
+      peerConnectionRef.current = createPeerConnection();
 
-      socketRef.current.on('start-connection', async ({ deviceType: initiatorType }) => {
+      stream.getTracks().forEach(track => {
+        peerConnectionRef.current.addTrack(track, stream);
+      });
+
+      socketRef.current.on('connect', () => {
+        console.log('Socket connected');
+        socketRef.current.emit('joinRoom', { roomId, deviceType });
+      });
+
+      socketRef.current.on('roomReady', async () => {
         if (deviceType === 'laptop') {
-          const offer = await peerRef.current.createOffer();
-          await peerRef.current.setLocalDescription(offer);
+          const offer = await peerConnectionRef.current.createOffer();
+          await peerConnectionRef.current.setLocalDescription(offer);
           socketRef.current.emit('offer', { roomId, offer });
         }
       });
 
       socketRef.current.on('offer', async (offer) => {
-        await peerRef.current.setRemoteDescription(offer);
-        const answer = await peerRef.current.createAnswer();
-        await peerRef.current.setLocalDescription(answer);
+        await peerConnectionRef.current.setRemoteDescription(new RTCSessionDescription(offer));
+        const answer = await peerConnectionRef.current.createAnswer();
+        await peerConnectionRef.current.setLocalDescription(answer);
         socketRef.current.emit('answer', { roomId, answer });
       });
 
       socketRef.current.on('answer', async (answer) => {
-        await peerRef.current.setRemoteDescription(answer);
+        await peerConnectionRef.current.setRemoteDescription(new RTCSessionDescription(answer));
       });
 
-      socketRef.current.on('ice-candidate', async (candidate) => {
+      socketRef.current.on('iceCandidate', async (candidate) => {
         try {
-          await peerRef.current.addIceCandidate(candidate);
+          await peerConnectionRef.current.addIceCandidate(new RTCIceCandidate(candidate));
         } catch (error) {
-          console.error('Ice candidate error:', error);
+          console.error('Error adding ICE candidate:', error);
         }
       });
 
-      socketRef.current.on('device-disconnected', (disconnectedDevice) => {
-        setStatus(`${disconnectedDevice} disconnected`);
-        setIsConnected(false);
+      socketRef.current.on('participantLeft', ({ deviceType }) => {
+        setStatus(`${deviceType} disconnected`);
         if (remoteVideoRef.current) {
           remoteVideoRef.current.srcObject = null;
         }
+        setConnected(false);
       });
 
-      setIsConnected(true);
-      setStatus('Connected');
+      socketRef.current.on('connect_error', (error) => {
+        setStatus('Connection error: ' + error.message);
+      });
+
+      setConnected(true);
+      setStatus('Connected to room');
     } catch (error) {
-      setStatus(`Connection failed: ${error.message}`);
+      setStatus('Failed to connect: ' + error.message);
+      console.error('Connection error:', error);
     }
   };
 
   useEffect(() => {
     return () => {
-      streamRef.current?.getTracks().forEach(track => track.stop());
-      peerRef.current?.close();
+      localStreamRef.current?.getTracks().forEach(track => track.stop());
+      peerConnectionRef.current?.close();
       socketRef.current?.disconnect();
     };
   }, []);
@@ -129,48 +152,50 @@ const VideoShare = () => {
           type="text"
           value={roomId}
           onChange={(e) => setRoomId(e.target.value)}
-          placeholder="Room ID"
+          placeholder="Enter Room ID"
           className="border p-2 mr-2"
-          disabled={isConnected}
+          disabled={connected}
         />
         <select
           value={deviceType}
           onChange={(e) => setDeviceType(e.target.value)}
           className="border p-2 mr-2"
-          disabled={isConnected}
+          disabled={connected}
         >
           <option value="laptop">Laptop Screen</option>
           <option value="phone">Phone Screen</option>
         </select>
         <button
           onClick={handleConnect}
-          disabled={isConnected}
-          className="bg-blue-500 text-white p-2 rounded"
+          disabled={connected}
+          className="bg-blue-500 text-white px-4 py-2 rounded"
         >
-          {isConnected ? 'Connected' : 'Connect'}
+          {connected ? 'Connected' : 'Connect'}
         </button>
       </div>
 
-      <div className="text-sm mb-4">{status}</div>
+      {status && (
+        <div className="mb-4 text-sm text-gray-600">{status}</div>
+      )}
 
       <div className="flex gap-4">
         <div>
-          <h3>{deviceType === 'laptop' ? 'Laptop Screen' : 'Phone Screen'}</h3>
+          <h3 className="font-bold mb-2">Local Video</h3>
           <video
             ref={localVideoRef}
             autoPlay
             playsInline
             muted
-            className="w-[400px] h-[300px] border"
+            className="w-[400px] h-[300px] bg-gray-100 border"
           />
         </div>
         <div>
-          <h3>{deviceType === 'laptop' ? 'Phone Screen' : 'Laptop Screen'}</h3>
+          <h3 className="font-bold mb-2">Remote Video</h3>
           <video
             ref={remoteVideoRef}
             autoPlay
             playsInline
-            className="w-[400px] h-[300px] border"
+            className="w-[400px] h-[300px] bg-gray-100 border"
           />
         </div>
       </div>
@@ -178,4 +203,4 @@ const VideoShare = () => {
   );
 };
 
-export default VideoShare;
+export default CameraSync;
