@@ -1,145 +1,222 @@
-import React, { useEffect, useRef, useState } from 'react';
-import io from 'socket.io-client';
+import React, { useEffect, useRef, useState, useCallback } from 'react';
+import { io } from 'socket.io-client';
 
-const socket = io('https://exam-temp-backend.onrender.com'); // Backend URL
+const SERVER_URL = process.env.REACT_APP_SERVER_URL || 'http://localhost:8888';
 
 const CameraSync = () => {
-  const laptopVideoRef = useRef(null);
-  const mobileVideoRef = useRef(null);
-  const [peerConnection, setPeerConnection] = useState(null);
   const [examId, setExamId] = useState('');
-  const [role, setRole] = useState('laptop'); // Role can be 'laptop' or 'mobile'
-  const [stream, setStream] = useState(null);
+  const [role, setRole] = useState('laptop');
+  const [isConnected, setIsConnected] = useState(false);
+  const [error, setError] = useState('');
+  
+  const localVideoRef = useRef(null);
+  const remoteVideoRef = useRef(null);
+  const socketRef = useRef(null);
+  const peerConnectionRef = useRef(null);
+  const localStreamRef = useRef(null);
 
-  useEffect(() => {
-    // Function to start the camera stream
-    const startCamera = async (role) => {
-      try {
-        const userStream = await navigator.mediaDevices.getUserMedia({ video: true });
-        setStream(userStream);
+  // Initialize WebRTC peer connection
+  const createPeerConnection = useCallback(() => {
+    const configuration = {
+      iceServers: [
+        { urls: 'stun:stun.l.google.com:19302' },
+        { urls: 'stun:stun1.l.google.com:19302' }
+      ]
+    };
 
-        if (role === 'laptop') {
-          laptopVideoRef.current.srcObject = userStream;
-        } else {
-          mobileVideoRef.current.srcObject = userStream;
-        }
+    const peerConnection = new RTCPeerConnection(configuration);
 
-        return userStream;
-      } catch (error) {
-        console.error('Error accessing camera:', error);
+    peerConnection.onicecandidate = (event) => {
+      if (event.candidate) {
+        socketRef.current?.emit('iceCandidate', {
+          candidate: event.candidate,
+          examId,
+          targetRole: role === 'laptop' ? 'mobile' : 'laptop'
+        });
       }
     };
 
-    // Function to initialize WebRTC connection
-    const initWebRTC = (stream) => {
-      const pc = new RTCPeerConnection({
-        iceServers: [{ urls: 'stun:stun.l.google.com:19302' }],
-      });
-
-      stream.getTracks().forEach((track) => pc.addTrack(track, stream));
-
-      pc.ontrack = (event) => {
-        if (role === 'laptop') {
-          mobileVideoRef.current.srcObject = event.streams[0];
-        } else {
-          laptopVideoRef.current.srcObject = event.streams[0];
-        }
-      };
-
-      pc.onicecandidate = (event) => {
-        if (event.candidate) {
-          socket.emit('candidate', { candidate: event.candidate, examId });
-        }
-      };
-
-      setPeerConnection(pc);
+    peerConnection.ontrack = (event) => {
+      if (remoteVideoRef.current) {
+        remoteVideoRef.current.srcObject = event.streams[0];
+      }
     };
 
-    // Join a room with examId and role
-    const joinRoom = async (examId, role) => {
-      socket.emit('joinRoom', { examId, role });
-      const userStream = await startCamera(role);
-      initWebRTC(userStream);
-    };
-
-    if (examId && role) {
-      joinRoom(examId, role);
-    }
-
-    return () => {
-      if (peerConnection) peerConnection.close();
-    };
+    return peerConnection;
   }, [examId, role]);
 
+  // Start local camera stream
+  const startLocalStream = useCallback(async () => {
+    try {
+      const stream = await navigator.mediaDevices.getUserMedia({ 
+        video: true,
+        audio: false
+      });
+      
+      localStreamRef.current = stream;
+      if (localVideoRef.current) {
+        localVideoRef.current.srcObject = stream;
+      }
+      
+      return stream;
+    } catch (err) {
+      setError('Failed to access camera. Please check permissions.');
+      console.error('Error accessing media devices:', err);
+    }
+  }, []);
+
+  // Initialize connection
+  const initializeConnection = useCallback(async () => {
+    if (!examId || !role) return;
+
+    try {
+      // Start local stream
+      const stream = await startLocalStream();
+      if (!stream) return;
+
+      // Create and store peer connection
+      const peerConnection = createPeerConnection();
+      peerConnectionRef.current = peerConnection;
+
+      // Add local stream tracks to peer connection
+      stream.getTracks().forEach(track => {
+        peerConnection.addTrack(track, stream);
+      });
+
+      // Connect to signaling server
+      socketRef.current = io(SERVER_URL);
+      
+      // Join room
+      socketRef.current.emit('joinRoom', { examId, role });
+      
+      // Handle connection ready
+      socketRef.current.on('ready', async () => {
+        if (role === 'laptop') {
+          const offer = await peerConnection.createOffer();
+          await peerConnection.setLocalDescription(offer);
+          socketRef.current.emit('offer', {
+            offer,
+            examId,
+            targetRole: 'mobile'
+          });
+        }
+      });
+
+      // Handle offer
+      socketRef.current.on('offer', async ({ offer }) => {
+        await peerConnection.setRemoteDescription(new RTCSessionDescription(offer));
+        const answer = await peerConnection.createAnswer();
+        await peerConnection.setLocalDescription(answer);
+        socketRef.current.emit('answer', {
+          answer,
+          examId,
+          targetRole: role === 'laptop' ? 'mobile' : 'laptop'
+        });
+      });
+
+      // Handle answer
+      socketRef.current.on('answer', async ({ answer }) => {
+        await peerConnection.setRemoteDescription(new RTCSessionDescription(answer));
+      });
+
+      // Handle ICE candidates
+      socketRef.current.on('iceCandidate', async ({ candidate }) => {
+        try {
+          await peerConnection.addIceCandidate(new RTCIceCandidate(candidate));
+        } catch (err) {
+          console.error('Error adding ICE candidate:', err);
+        }
+      });
+
+      // Handle peer disconnection
+      socketRef.current.on('peerDisconnected', () => {
+        setIsConnected(false);
+        if (remoteVideoRef.current) {
+          remoteVideoRef.current.srcObject = null;
+        }
+      });
+
+      setIsConnected(true);
+    } catch (err) {
+      setError('Failed to initialize connection');
+      console.error('Connection error:', err);
+    }
+  }, [examId, role, createPeerConnection, startLocalStream]);
+
+  // Cleanup function
   useEffect(() => {
-    if (!peerConnection) return;
+    return () => {
+      localStreamRef.current?.getTracks().forEach(track => track.stop());
+      peerConnectionRef.current?.close();
+      socketRef.current?.disconnect();
+    };
+  }, []);
 
-    socket.on('startVideoSync', ({ role }) => {
-      if (role === 'laptop') {
-        socket.emit('offer', { offer: peerConnection.localDescription, examId });
-      } else {
-        socket.emit('offer', { offer: peerConnection.localDescription, examId });
-      }
-    });
-
-    socket.on('offer', async (data) => {
-      await peerConnection.setRemoteDescription(new RTCSessionDescription(data.offer));
-      const answer = await peerConnection.createAnswer();
-      await peerConnection.setLocalDescription(answer);
-      socket.emit('answer', { answer, examId });
-    });
-
-    socket.on('answer', async (data) => {
-      await peerConnection.setRemoteDescription(new RTCSessionDescription(data.answer));
-    });
-
-    socket.on('candidate', async (data) => {
-      try {
-        await peerConnection.addIceCandidate(new RTCIceCandidate(data.candidate));
-      } catch (error) {
-        console.error('Error adding ICE candidate:', error);
-      }
-    });
-  }, [peerConnection, examId]);
-
-  const handleExamIdChange = (e) => {
-    setExamId(e.target.value);
-  };
-
-  const handleRoleChange = (e) => {
-    setRole(e.target.value);
+  const handleConnect = () => {
+    if (!examId) {
+      setError('Please enter an exam ID');
+      return;
+    }
+    setError('');
+    initializeConnection();
   };
 
   return (
-    <div>
-      <h2>Camera Sync</h2>
-      <input
-        type="text"
-        placeholder="Enter Exam ID"
-        value={examId}
-        onChange={handleExamIdChange}
-      />
-      <select onChange={handleRoleChange} value={role}>
-        <option value="laptop">Laptop</option>
-        <option value="mobile">Mobile</option>
-      </select>
-      <div style={{ display: 'flex', gap: '20px' }}>
+    <div className="p-4">
+      <h2 className="text-2xl font-bold mb-4">Camera Sync</h2>
+      
+      <div className="mb-4 flex gap-4">
+        <input
+          type="text"
+          placeholder="Enter Exam ID"
+          value={examId}
+          onChange={(e) => setExamId(e.target.value)}
+          className="border p-2 rounded"
+          disabled={isConnected}
+        />
+        
+        <select
+          value={role}
+          onChange={(e) => setRole(e.target.value)}
+          className="border p-2 rounded"
+          disabled={isConnected}
+        >
+          <option value="laptop">Laptop</option>
+          <option value="mobile">Mobile</option>
+        </select>
+        
+        <button
+          onClick={handleConnect}
+          disabled={isConnected}
+          className="bg-blue-500 text-white px-4 py-2 rounded disabled:bg-gray-400"
+        >
+          {isConnected ? 'Connected' : 'Connect'}
+        </button>
+      </div>
+
+      {error && (
+        <div className="text-red-500 mb-4">{error}</div>
+      )}
+
+      <div className="flex gap-4">
         <div>
-          <h3>{role === 'laptop' ? 'Laptop Camera' : 'Mobile Camera'}</h3>
+          <h3 className="font-bold mb-2">Local Camera</h3>
           <video
-            ref={laptopVideoRef}
+            ref={localVideoRef}
             autoPlay
             playsInline
-            style={{ width: '300px', border: '1px solid #ccc' }}
+            muted
+            className="w-[400px] h-[300px] border rounded bg-gray-100"
           />
         </div>
+        
         <div>
-          <h3>{role === 'laptop' ? 'Mobile Camera' : 'Laptop Camera'}</h3>
+          <h3 className="font-bold mb-2">Remote Camera</h3>
           <video
-            ref={mobileVideoRef}
+            ref={remoteVideoRef}
             autoPlay
             playsInline
-            style={{ width: '300px', border: '1px solid #ccc' }}
+            className="w-[400px] h-[300px] border rounded bg-gray-100"
           />
         </div>
       </div>
