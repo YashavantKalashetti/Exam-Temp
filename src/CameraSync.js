@@ -10,24 +10,11 @@ const CameraSync = ({ role }) => {
   const [peerConnection, setPeerConnection] = useState(null);
 
   useEffect(() => {
-    const startLocalCamera = async () => {
-      try {
-        const stream = await navigator.mediaDevices.getUserMedia({ video: true });
-        if (localVideoRef.current) {
-          localVideoRef.current.srcObject = stream;
-        }
-        if (peerConnection && role === "mobile") {
-          // Add local stream to peer connection for "mobile"
-          stream.getTracks().forEach((track) => peerConnection.addTrack(track, stream));
-        }
-      } catch (error) {
-        console.error("Error accessing camera:", error);
-      }
-    };
-
     const initWebRTC = () => {
+      if (peerConnection) return; // Avoid multiple PeerConnection instances
+
       const pc = new RTCPeerConnection({
-        iceServers: [{ urls: "stun:stun.l.google.com:19302" }], // Free STUN server
+        iceServers: [{ urls: "stun:stun.l.google.com:19302" }],
       });
 
       pc.ontrack = (event) => {
@@ -43,13 +30,32 @@ const CameraSync = ({ role }) => {
       };
 
       setPeerConnection(pc);
+      return pc;
     };
 
-    startLocalCamera();
-    initWebRTC();
+    const startLocalCamera = async (pc) => {
+      try {
+        const stream = await navigator.mediaDevices.getUserMedia({ video: true });
+        if (localVideoRef.current) {
+          localVideoRef.current.srcObject = stream;
+        }
+        if (role === "mobile") {
+          // Add local stream tracks to PeerConnection for mobile role
+          stream.getTracks().forEach((track) => pc.addTrack(track, stream));
+        }
+      } catch (error) {
+        console.error("Error accessing local camera:", error);
+      }
+    };
+
+    const pc = initWebRTC();
+    startLocalCamera(pc);
 
     return () => {
-      if (peerConnection) peerConnection.close();
+      if (peerConnection) {
+        peerConnection.close();
+        setPeerConnection(null);
+      }
     };
   }, [peerConnection, role]);
 
@@ -58,23 +64,35 @@ const CameraSync = ({ role }) => {
 
     if (role === "laptop") {
       socket.on("offer", async (data) => {
-        await peerConnection.setRemoteDescription(new RTCSessionDescription(data));
-        const answer = await peerConnection.createAnswer();
-        await peerConnection.setLocalDescription(answer);
-        socket.emit("answer", answer);
+        try {
+          await peerConnection.setRemoteDescription(new RTCSessionDescription(data));
+          const answer = await peerConnection.createAnswer();
+          await peerConnection.setLocalDescription(answer);
+          socket.emit("answer", answer);
+        } catch (error) {
+          console.error("Error handling offer:", error);
+        }
       });
     } else if (role === "mobile") {
       const createAndSendOffer = async () => {
-        const offer = await peerConnection.createOffer();
-        await peerConnection.setLocalDescription(offer);
-        socket.emit("offer", offer);
+        try {
+          const offer = await peerConnection.createOffer();
+          await peerConnection.setLocalDescription(offer);
+          socket.emit("offer", offer);
+        } catch (error) {
+          console.error("Error creating and sending offer:", error);
+        }
       };
       createAndSendOffer();
     }
 
     socket.on("answer", async (data) => {
       if (role === "mobile") {
-        await peerConnection.setRemoteDescription(new RTCSessionDescription(data));
+        try {
+          await peerConnection.setRemoteDescription(new RTCSessionDescription(data));
+        } catch (error) {
+          console.error("Error handling answer:", error);
+        }
       }
     });
 
