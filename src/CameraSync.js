@@ -3,29 +3,36 @@ import io from "socket.io-client";
 
 const socket = io("https://exam-temp-backend.onrender.com"); // Backend signaling server
 
-const CameraSync = ({ role }) => {
-  const localVideoRef = useRef(null);
-  const remoteVideoRef = useRef(null);
+const CameraSync = ({ role, examId }) => {
+  const laptopVideoRef = useRef(null); // Ref for laptop camera
+  const mobileVideoRef = useRef(null); // Ref for mobile camera
 
   const [peerConnection, setPeerConnection] = useState(null);
 
   useEffect(() => {
-    const initWebRTC = () => {
-      if (peerConnection) return; // Avoid multiple PeerConnection instances
+    if (!examId) {
+      console.error("Exam ID is required");
+      return;
+    }
 
+    // Join the signaling room with the Exam ID
+    socket.emit("joinRoom", { examId });
+
+    // WebRTC Peer Connection setup
+    const initWebRTC = () => {
       const pc = new RTCPeerConnection({
         iceServers: [{ urls: "stun:stun.l.google.com:19302" }],
       });
 
       pc.ontrack = (event) => {
-        if (remoteVideoRef.current) {
-          remoteVideoRef.current.srcObject = event.streams[0];
+        if (mobileVideoRef.current && event.streams[0]) {
+          mobileVideoRef.current.srcObject = event.streams[0];
         }
       };
 
       pc.onicecandidate = (event) => {
         if (event.candidate) {
-          socket.emit("candidate", event.candidate);
+          socket.emit("candidate", { candidate: event.candidate, examId });
         }
       };
 
@@ -36,15 +43,13 @@ const CameraSync = ({ role }) => {
     const startLocalCamera = async (pc) => {
       try {
         const stream = await navigator.mediaDevices.getUserMedia({ video: true });
-        if (localVideoRef.current) {
-          localVideoRef.current.srcObject = stream;
+        if (laptopVideoRef.current) {
+          laptopVideoRef.current.srcObject = stream;
         }
-        if (role === "mobile") {
-          // Add local stream tracks to PeerConnection for mobile role
-          stream.getTracks().forEach((track) => pc.addTrack(track, stream));
-        }
+        // Add the stream from laptop camera to the peer connection
+        stream.getTracks().forEach((track) => pc.addTrack(track, stream));
       } catch (error) {
-        console.error("Error accessing local camera:", error);
+        console.error("Error accessing laptop camera:", error);
       }
     };
 
@@ -54,31 +59,35 @@ const CameraSync = ({ role }) => {
     return () => {
       if (peerConnection) {
         peerConnection.close();
-        setPeerConnection(null);
       }
+      socket.emit("leaveRoom", { examId });
     };
-  }, [peerConnection, role]);
+  }, [examId]);
 
   useEffect(() => {
     if (!peerConnection) return;
 
+    // Laptop is the offerer
     if (role === "laptop") {
-      socket.on("offer", async (data) => {
+      socket.on("offer", async ({ offer }) => {
         try {
-          await peerConnection.setRemoteDescription(new RTCSessionDescription(data));
+          await peerConnection.setRemoteDescription(new RTCSessionDescription(offer));
           const answer = await peerConnection.createAnswer();
           await peerConnection.setLocalDescription(answer);
-          socket.emit("answer", answer);
+          socket.emit("answer", { answer, examId });
         } catch (error) {
           console.error("Error handling offer:", error);
         }
       });
-    } else if (role === "mobile") {
+    }
+
+    // Mobile is the offer receiver and will send the offer
+    if (role === "mobile") {
       const createAndSendOffer = async () => {
         try {
           const offer = await peerConnection.createOffer();
           await peerConnection.setLocalDescription(offer);
-          socket.emit("offer", offer);
+          socket.emit("offer", { offer, examId });
         } catch (error) {
           console.error("Error creating and sending offer:", error);
         }
@@ -86,47 +95,46 @@ const CameraSync = ({ role }) => {
       createAndSendOffer();
     }
 
-    socket.on("answer", async (data) => {
+    // Handle the answer from the laptop
+    socket.on("answer", async ({ answer }) => {
       if (role === "mobile") {
         try {
-          await peerConnection.setRemoteDescription(new RTCSessionDescription(data));
+          await peerConnection.setRemoteDescription(new RTCSessionDescription(answer));
         } catch (error) {
           console.error("Error handling answer:", error);
         }
       }
     });
 
-    socket.on("candidate", async (data) => {
+    // Handle ICE candidates
+    socket.on("candidate", async ({ candidate }) => {
       try {
-        await peerConnection.addIceCandidate(new RTCIceCandidate(data));
+        await peerConnection.addIceCandidate(new RTCIceCandidate(candidate));
       } catch (error) {
         console.error("Error adding ICE candidate:", error);
       }
     });
-  }, [peerConnection, role]);
+  }, [peerConnection, role, examId]);
 
   return (
-    <div>
-      <h2>Camera Sync ({role === "laptop" ? "Laptop" : "Mobile"})</h2>
-      <div style={{ display: "flex", gap: "20px" }}>
-        <div>
-          <h3>Local Camera</h3>
-          <video
-            ref={localVideoRef}
-            autoPlay
-            playsInline
-            style={{ width: "300px", height: "auto", border: "1px solid #ccc" }}
-          />
-        </div>
-        <div>
-          <h3>Remote Camera</h3>
-          <video
-            ref={remoteVideoRef}
-            autoPlay
-            playsInline
-            style={{ width: "300px", height: "auto", border: "1px solid #ccc" }}
-          />
-        </div>
+    <div style={{ display: "flex", gap: "20px" }}>
+      <div>
+        <h3>Laptop Camera</h3>
+        <video
+          ref={laptopVideoRef}
+          autoPlay
+          playsInline
+          style={{ width: "300px", height: "auto", border: "1px solid #ccc" }}
+        />
+      </div>
+      <div>
+        <h3>Mobile Camera</h3>
+        <video
+          ref={mobileVideoRef}
+          autoPlay
+          playsInline
+          style={{ width: "300px", height: "auto", border: "1px solid #ccc" }}
+        />
       </div>
     </div>
   );
