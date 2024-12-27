@@ -1,7 +1,7 @@
 import React, { useEffect, useRef, useState } from "react";
 import io from "socket.io-client";
 
-const socket = io("http://localhost:3001"); // Connect to signaling server
+const socket = io("https://exam-temp-backend.onrender.com"); // Connect to signaling server
 
 const CameraSync = () => {
   const laptopVideoRef = useRef(null);
